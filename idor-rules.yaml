@@ -1,0 +1,1847 @@
+# yamllint disable
+# Boost IDOR / broken-access-control ruleset.
+#
+# Semgrep-format rules in the same layout as the boost-community/sast-rules aggregate.
+# Rule id convention: <language>_idor_rule-<Name>.
+# Languages: csharp, java, javascript/typescript, python, go, php.
+#
+# Most rules are audit-level (subcategory: audit). IDOR is an authorization-logic flaw, so SAST can only
+# surface candidates; confirm with authenticated multi-user DAST (Burp Autorize/AuthMatrix) or tests.
+# Each rule was validated with `semgrep --test` against vulnerable and safe fixtures (see the tests bundle).
+# Add a `license` field to metadata if your Boost aggregation requires one.
+# yamllint enable
+
+rules:
+- id: csharp_idor_rule-OptionalOwnershipParameter
+  severity: ERROR
+  languages:
+  - csharp
+  message: Action parameter '$P' identifies or verifies the record owner but defaults to null, so a caller can omit
+    it and skip the ownership check. Make the parameter required and validate it before any data lookup.
+  metadata:
+    help: |-
+      Consider making the parameter required by removing the `= null` default and rejecting the
+      request (400/403) when it is missing or does not match the record. Do this check before any data
+      lookup, not only when the value is provided. Better still, do not accept the owner from the
+      client at all: read it from `User.FindFirstValue(ClaimTypes.NameIdentifier)` and scope the query
+      to it, for example `db.Bookings.Where(b => b.Id == id && b.OwnerId == userId)`. For
+      secondary-factor checks (such as last name on a PNR lookup), use a constant-time comparison
+      (`CryptographicOperations.FixedTimeEquals`) and rate limit the endpoint.
+    shortDescription: Optional ownership/verification parameter
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - csharp
+    - dotnet
+    - webapi
+    - aspnetcore
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+  patterns:
+  - pattern: |
+      public $RET $METHOD(..., string $P = null, ...)
+      {
+        ...
+      }
+  - metavariable-regex:
+      metavariable: $P
+      regex: (?i)^(l|last)?_?name$|^surname$|^owner_?id$|^user_?id$|^account_?id$|^customer_?id$|^tenant_?id$
+- id: csharp_idor_rule-LookupWithoutOwnershipCheck
+  severity: WARNING
+  languages:
+  - csharp
+  message: Client-supplied identifier '$ID' is used for a record lookup and the action never consults the caller's
+    identity or runs a verification call first. Scope the query to the caller (WHERE id = @id AND owner = @user),
+    use resource-based authorization, or verify a secondary factor before returning data.
+  metadata:
+    help: |-
+      Verify that the authenticated caller may access the record before returning or changing it.
+      Scope the query to the caller, for example `db.Orders.FirstOrDefault(o => o.Id == id &&
+      o.OwnerId == User.FindFirstValue(ClaimTypes.NameIdentifier))`, and return 404 when nothing
+      matches. For more complex ownership rules, use ASP.NET Core resource-based authorization: load
+      the resource, call `await _authorizationService.AuthorizeAsync(User, resource, "SameOwner")` and
+      return `Forbid()` on failure. If the endpoint is intentionally public (for example a lookup by
+      record locator plus last name), verify that second factor before the lookup and rate limit the
+      endpoint. This rule flags candidates: confirm by requesting another user's record with a second
+      test account and checking that it is refused.
+    shortDescription: Object lookup by client-supplied ID without ownership check
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - csharp
+    - dotnet
+    - webapi
+    - aspnetcore
+    - entityframework
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-inside: |
+      public $RET $METHOD(..., $T $ID, ...)
+      {
+        ...
+      }
+  - metavariable-regex:
+      metavariable: $ID
+      regex: (?i)^(?!(user|owner|customer|account|tenant|member|profile)_?id$)(\w*_?id|pk|uuid|guid|locator|recordlocator|reservationnumber)$
+  - pattern-either:
+    - patterns:
+      - pattern: $X.$GET($ID, ...)
+      - metavariable-regex:
+          metavariable: $GET
+          regex: ^(Get|Find|Load|Fetch|Read|Retrieve)\w*$
+    - pattern: $CTX.$SET.Find($ID)
+    - pattern: $CTX.$SET.FindAsync($ID)
+    - pattern: $Q.FirstOrDefault($P => $P.$F == $ID)
+    - pattern: $Q.FirstOrDefaultAsync($P => $P.$F == $ID)
+    - pattern: $Q.SingleOrDefault($P => $P.$F == $ID)
+    - pattern: $Q.SingleOrDefaultAsync($P => $P.$F == $ID)
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        User.FindFirst(...);
+        ...
+      }
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        User.FindFirstValue(...);
+        ...
+      }
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        User.IsInRole(...);
+        ...
+      }
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        var $ME = User.Identity.$NN;
+        ...
+      }
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        $S.AuthorizeAsync(...);
+        ...
+      }
+  - pattern-not-inside: |
+      if (!$V(..., $ID, ...)) { ... }
+      ...
+- id: csharp_idor_rule-ClientSuppliedIdentity
+  severity: WARNING
+  languages:
+  - csharp
+  message: The caller's identity ('$U') is taken from a request parameter and used to load data. Any client can
+    send another user's value. Derive the identity from the authenticated principal (User.FindFirst / HttpContext.User).
+  metadata:
+    help: |-
+      Consider removing the identity parameter from the action and deriving it from the authenticated
+      principal instead, for example `var userId = User.FindFirstValue(ClaimTypes.NameIdentifier);`.
+      If administrators legitimately act on behalf of other users, keep the parameter but gate it with
+      an explicit role or policy check (`[Authorize(Roles = "Admin")]` or `AuthorizeAsync`) and fall
+      back to the caller's own ID for everyone else. Never trust a user, account, customer or tenant
+      ID sent by the client as proof of who the caller is.
+    shortDescription: Identity taken from client-controlled input
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - csharp
+    - dotnet
+    - webapi
+    - aspnetcore
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-inside: |
+      public $RET $METHOD(..., $T $U, ...)
+      {
+        ...
+      }
+  - metavariable-regex:
+      metavariable: $U
+      regex: (?i)^(user_?id|owner_?id|customer_?id|account_?id|tenant_?id|member_?id|profile_?id)$
+  - pattern: $X.$OP(..., $U, ...)
+  - metavariable-regex:
+      metavariable: $OP
+      regex: ^(Get|Find|Load|Fetch|Read|Delete|Update|Remove|Save)\w*$
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        User.FindFirst(...);
+        ...
+      }
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        User.FindFirstValue(...);
+        ...
+      }
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        User.IsInRole(...);
+        ...
+      }
+  - pattern-not-inside: |
+      public $RET $M(...)
+      {
+        ...
+        var $ME = User.Identity.$NN;
+        ...
+      }
+- id: csharp_idor_rule-ForwardedForTrusted
+  severity: WARNING
+  languages:
+  - csharp
+  message: X-Forwarded-For is client-controlled. Using it for rate limiting, lockout or allow-listing lets an attacker
+    rotate the header to bypass the control. Only trust it from a known proxy (ForwardedHeadersOptions.KnownProxies).
+  metadata:
+    help: |-
+      Consider using `HttpContext.Connection.RemoteIpAddress` together with the `ForwardedHeaders`
+      middleware instead of reading the header directly. Configure `ForwardedHeadersOptions` with
+      `KnownProxies` or `KnownNetworks` set to your load balancers so only their values are trusted,
+      and set `ForwardLimit` to the number of proxy hops. If you must parse the header yourself, take
+      the right-most address that does not belong to a trusted proxy, never the first one. Do not use
+      the client IP as the only key for rate limiting, lockout or allow-listing; combine it with the
+      account or session identifier.
+    shortDescription: Client IP taken from spoofable header
+    cwe: CWE-348
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - csharp
+    - dotnet
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/348.html
+  pattern-either:
+  - pattern: $R.Headers["X-Forwarded-For"]
+  - pattern: $R.Headers.GetValues("X-Forwarded-For")
+  - pattern: $R.ServerVariables["HTTP_X_FORWARDED_FOR"]
+- id: csharp_idor_rule-EmptyCatchBlock
+  severity: WARNING
+  languages:
+  - csharp
+  message: Empty catch block swallows the error. When it wraps a configuration, feature-flag or authorization lookup,
+    a failure silently falls back to the insecure default. Log and fail closed.
+  metadata:
+    help: |-
+      Consider logging the exception (for example `_logger.LogError(ex, "...")`) and handling it
+      explicitly. When the try block reads configuration, a feature flag or an authorization decision,
+      fail closed: deny the request or rethrow instead of continuing with a default that disables the
+      check. Catch only the exception types you expect rather than `Exception`. If ignoring the error
+      really is correct, add a comment explaining why so reviewers can tell it is intentional.
+    shortDescription: Swallowed exception
+    cwe: CWE-390
+    owasp:
+    - A09:2021 - Security Logging and Monitoring Failures
+    category: security
+    technology:
+    - csharp
+    - dotnet
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/390.html
+  pattern: |
+    try { ... } catch ($T $E) { }
+- id: java_idor_rule-LookupWithoutOwnershipCheck
+  severity: WARNING
+  languages:
+  - java
+  message: Client-supplied identifier is used to load a record, and this handler never consults the caller's identity
+    or runs a verification call first. Scope the query to the caller (WHERE id = ? AND owner = ?), apply resource-level
+    authorization, or verify a secondary factor before returning data.
+  metadata:
+    help: |-
+      Verify that the authenticated caller may access the record before returning or changing it.
+      Scope the repository query to the caller, for example `orderRepository.findByIdAndOwnerId(id,
+      principal.getName())`, and return 404 when nothing matches. With Spring Security you can also
+      use method security, such as `@PreAuthorize("@orderSecurity.isOwner(#id, authentication)")` or
+      `@PostAuthorize("returnObject.ownerId == authentication.name")`. If the endpoint is
+      intentionally public (for example a lookup by record locator plus last name), verify that second
+      factor before the lookup and rate limit the endpoint. This rule flags candidates: confirm by
+      requesting another user's record with a second test account and checking that it is refused.
+    shortDescription: Object lookup by client-supplied ID without ownership check
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - java
+    - spring
+    - jaxrs
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-either:
+    - pattern-inside: |
+        $RET $M(..., @PathVariable $T $ID, ...) { ... }
+    - pattern-inside: |
+        $RET $M(..., @PathVariable(...) $T $ID, ...) { ... }
+    - pattern-inside: |
+        $RET $M(..., @RequestParam $T $ID, ...) { ... }
+    - pattern-inside: |
+        $RET $M(..., @RequestParam(...) $T $ID, ...) { ... }
+    - pattern-inside: |
+        $RET $M(..., @PathParam(...) $T $ID, ...) { ... }
+    - pattern-inside: |
+        $RET $M(..., @QueryParam(...) $T $ID, ...) { ... }
+  - metavariable-regex:
+      metavariable: $ID
+      regex: (?i)^[\"']?\$?(?!(user|owner|customer|account|tenant|member|profile)_?id[\"']?$)(\w*_?id|pk|uuid|guid|locator|recordlocator|reservationnumber)[\"']?$
+  - pattern-either:
+    - pattern: $R.findById($ID)
+    - pattern: $R.getById($ID)
+    - pattern: $R.getOne($ID)
+    - pattern: $R.getReferenceById($ID)
+    - pattern: $EM.find($CLS.class, $ID)
+  - pattern-not-inside: |
+      $RT $MM(..., Principal $PR, ...) { ... }
+  - pattern-not-inside: |
+      $RT $MM(..., Authentication $AU, ...) { ... }
+  - pattern-not-inside: |
+      $RT $MM(..., @AuthenticationPrincipal $TT $UU, ...) { ... }
+  - pattern-not-inside: |
+      @PreAuthorize(...)
+      $RT $MM(...) { ... }
+  - pattern-not-inside: |
+      @PostAuthorize(...)
+      $RT $MM(...) { ... }
+  - pattern-not-inside: |
+      $RT $MM(...) {
+        ...
+        SecurityContextHolder.getContext();
+        ...
+      }
+  - pattern-not-inside: |
+      $RT $MM(...) {
+        ...
+        $REQ.getUserPrincipal();
+        ...
+      }
+  - pattern-not-inside: |
+      if (!$V(..., $ID, ...)) { ... }
+      ...
+- id: java_idor_rule-OptionalOwnershipParameter
+  severity: ERROR
+  languages:
+  - java
+  message: A parameter that identifies or verifies the record owner is optional, so a caller can omit it and skip
+    the ownership check. Make it required and validate it before any data lookup; never validate it only 'if provided'.
+  metadata:
+    help: |-
+      Consider making the parameter required (`@RequestParam(required = true)`, or `@NotNull` on a
+      JAX-RS `@QueryParam`) and rejecting the request when it is missing or does not match the record.
+      Do this check before any data lookup, not inside an `if (param != null)` block that is skipped
+      when the value is absent. Better still, do not accept the owner from the client at all: take it
+      from `Principal` or `@AuthenticationPrincipal` and scope the query to it. For secondary-factor
+      checks (such as last name on a PNR lookup), compare with `MessageDigest.isEqual` and rate limit
+      the endpoint.
+    shortDescription: Optional ownership/verification parameter
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - java
+    - spring
+    - jaxrs
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-either:
+    - pattern: |
+        $RET $M(..., @RequestParam(..., required = false, ...) $T $P, ...) { ... }
+    - pattern: |
+        $RET $M(..., @RequestParam(..., required = false, ...) Optional<$T> $P, ...) { ... }
+    - pattern: |
+        $RET $M(..., @QueryParam(...) $T $P, ...) { ... }
+    - pattern: |
+        $RET $M(..., @RequestParam(..., defaultValue = $D, ...) $T $P, ...) { ... }
+    - pattern: |
+        if ($P != null) { ... }
+  - metavariable-regex:
+      metavariable: $P
+      regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+- id: java_idor_rule-ClientSuppliedIdentity
+  severity: WARNING
+  languages:
+  - java
+  message: The caller's identity is taken from a request parameter and used to load or change data. Any client can
+    send another user's value. Derive the identity from the authenticated session or principal instead.
+  metadata:
+    help: |-
+      Consider removing the identity parameter from the handler and deriving it from the authenticated
+      principal: add a `Principal`, `Authentication` or `@AuthenticationPrincipal` argument, or read
+      `SecurityContextHolder.getContext().getAuthentication()`. If administrators legitimately act on
+      behalf of other users, keep the parameter but gate it with an explicit check such as
+      `@PreAuthorize("hasRole('ADMIN') or #userId == authentication.name")`. Never trust a user,
+      account, customer or tenant ID sent by the client as proof of who the caller is.
+    shortDescription: Identity taken from client-controlled input
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - java
+    - spring
+    - jaxrs
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-inside: |
+      $RET $M(..., $T $U, ...) { ... }
+  - metavariable-regex:
+      metavariable: $U
+      regex: (?i)^[\"']?\$?(user_?id|owner_?id|customer_?id|account_?id|tenant_?id|member_?id|profile_?id)[\"']?$
+  - pattern: $X.$OP(..., $U, ...)
+  - metavariable-regex:
+      metavariable: $OP
+      regex: ^(get|find|load|fetch|read|delete|update|remove|save|select|query)\w*$
+  - pattern-not-inside: |
+      $RT $MM(..., Principal $PR, ...) { ... }
+  - pattern-not-inside: |
+      $RT $MM(..., Authentication $AU, ...) { ... }
+  - pattern-not-inside: |
+      $RT $MM(..., @AuthenticationPrincipal $TT $UU, ...) { ... }
+  - pattern-not-inside: |
+      $RT $MM(...) {
+        ...
+        SecurityContextHolder.getContext();
+        ...
+      }
+  - pattern-not-inside: |
+      $RT $MM(...) {
+        ...
+        $REQ.getUserPrincipal();
+        ...
+      }
+- id: java_idor_rule-ForwardedForTrusted
+  severity: WARNING
+  languages:
+  - java
+  message: X-Forwarded-For is client-controlled. Using it for rate limiting, lockout or allow-listing lets an attacker
+    rotate the header to bypass the control. Trust it only when set by a known proxy and take the right-most untrusted
+    hop.
+  metadata:
+    help: |-
+      Consider using `request.getRemoteAddr()` with your server's proxy handling instead of reading
+      the header directly: in Spring Boot set `server.forward-headers-strategy=native` and configure
+      Tomcat's `RemoteIpValve` `internal-proxies` to your load balancers, or use
+      `ForwardedHeaderFilter` only behind a proxy that overwrites the header. If you must parse the
+      header yourself, take the right-most address that does not belong to a trusted proxy, never the
+      first one. Do not use the client IP as the only key for rate limiting, lockout or allow-listing;
+      combine it with the account or session identifier.
+    shortDescription: Client IP taken from spoofable header
+    cwe: CWE-348
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - java
+    - spring
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/348.html
+  patterns:
+  - pattern-either:
+    - pattern: $R.getHeader($H)
+    - pattern: |
+        $RET $M(..., @RequestHeader($H) $T $P, ...) { ... }
+  - metavariable-regex:
+      metavariable: $H
+      regex: (?i)^[\"']?x.forwarded.for[\"']?$|(?i)^[\"']?http_x_forwarded_for[\"']?$
+- id: java_idor_rule-EmptyCatchBlock
+  severity: WARNING
+  languages:
+  - java
+  message: Error is swallowed. When this wraps a configuration, feature-flag or authorization lookup, a failure
+    silently falls back to the insecure default. Log the error and fail closed.
+  metadata:
+    help: |-
+      Consider logging the exception (for example `log.error("...", e)`) and handling it explicitly.
+      When the try block reads configuration, a feature flag or an authorization decision, fail
+      closed: deny the request or rethrow instead of continuing with a default that disables the
+      check. Catch only the exception types you expect rather than `Exception` or `Throwable`. If
+      ignoring the error really is correct, name the variable `ignored` and add a comment explaining
+      why.
+    shortDescription: Swallowed exception
+    cwe: CWE-390
+    owasp:
+    - A09:2021 - Security Logging and Monitoring Failures
+    category: security
+    technology:
+    - java
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/390.html
+  pattern: |
+    try { ... } catch ($T $E) { }
+- id: javascript_idor_rule-LookupWithoutOwnershipCheck
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript
+  message: Client-supplied identifier is used to load a record, and this handler never consults the caller's identity
+    or runs a verification call first. Scope the query to the caller (WHERE id = ? AND owner = ?), apply resource-level
+    authorization, or verify a secondary factor before returning data.
+  metadata:
+    help: |-
+      Verify that the authenticated caller may access the record before returning or changing it.
+      Scope the query to the caller, for example `Order.findOne({ _id: req.params.id, ownerId:
+      req.user.id })` (Mongoose) or `findOne({ where: { id: req.params.id, ownerId: req.user.id } })`
+      (Sequelize, Prisma, TypeORM), and return 404 when nothing matches. For more complex rules, use
+      an authorization middleware or a policy library such as CASL that loads the resource and checks
+      it before the handler runs. If the endpoint is intentionally public (for example a lookup by
+      record locator plus last name), verify that second factor before the lookup and rate limit the
+      endpoint. This rule flags candidates: confirm by requesting another user's record with a second
+      test account and checking that it is refused.
+    shortDescription: Object lookup by client-supplied ID without ownership check
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - javascript
+    - typescript
+    - express
+    - nodejs
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-either:
+    - pattern: $M.findById($REQ.$W.$X)
+    - pattern: $M.findByPk($REQ.$W.$X)
+    - pattern: '$M.findOne({ _id: $REQ.$W.$X })'
+    - pattern: '$M.findOne({ where: { id: $REQ.$W.$X } })'
+    - pattern: '$M.findUnique({ where: { id: $REQ.$W.$X } })'
+    - pattern: '$M.findOneBy({ id: $REQ.$W.$X })'
+    - pattern: '$M.destroy({ where: { id: $REQ.$W.$X } })'
+    - pattern: $M.findByIdAndDelete($REQ.$W.$X)
+    - pattern: $M.findByIdAndUpdate($REQ.$W.$X, ...)
+  - metavariable-regex:
+      metavariable: $W
+      regex: ^(params|query)$
+  - metavariable-regex:
+      metavariable: $X
+      regex: (?i)^[\"']?\$?(?!(user|owner|customer|account|tenant|member|profile)_?id[\"']?$)(\w*_?id|pk|uuid|guid|locator|recordlocator|reservationnumber)[\"']?$
+  - pattern-not-inside: |
+      ($REQ, ...) => { ... $REQ.user; ... }
+  - pattern-not-inside: |
+      function ($REQ, ...) { ... $REQ.user; ... }
+  - pattern-not-inside: |
+      function $F($REQ, ...) { ... $REQ.user; ... }
+  - pattern-not-inside: |
+      async function $F($REQ, ...) { ... $REQ.user; ... }
+  - pattern-not-inside: |
+      async ($REQ, ...) => { ... $REQ.user; ... }
+  - pattern-not-inside: |
+      ($REQ, ...) => { ... $REQ.session; ... }
+  - pattern-not-inside: |
+      function ($REQ, ...) { ... $REQ.session; ... }
+- id: javascript_idor_rule-NestLookupWithoutOwnershipCheck
+  severity: WARNING
+  languages:
+  - typescript
+  message: Client-supplied identifier is used to load a record, and this handler never consults the caller's identity
+    or runs a verification call first. Scope the query to the caller (WHERE id = ? AND owner = ?), apply resource-level
+    authorization, or verify a secondary factor before returning data.
+  metadata:
+    help: |-
+      Verify that the authenticated caller may access the record before returning or changing it.
+      Inject the current user into the handler (`@Req()` or a custom `@CurrentUser()` decorator), pass
+      it to the service and scope the query, for example `this.repo.findOneBy({ id, ownerId: user.id
+      })`, throwing `NotFoundException` when nothing matches. For reusable rules, implement a guard
+      (`CanActivate`) or use CASL abilities to authorize the loaded resource. If the endpoint is
+      intentionally public (for example a lookup by record locator plus last name), verify that second
+      factor before the lookup and rate limit the endpoint. This rule flags candidates: confirm by
+      requesting another user's record with a second test account and checking that it is refused.
+    shortDescription: Object lookup by client-supplied ID without ownership check
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - typescript
+    - nestjs
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-inside: |
+      $M(..., @Param(...) $ID: $T, ...) { ... }
+  - metavariable-regex:
+      metavariable: $ID
+      regex: (?i)^[\"']?\$?(?!(user|owner|customer|account|tenant|member|profile)_?id[\"']?$)(\w*_?id|pk|uuid|guid|locator|recordlocator|reservationnumber)[\"']?$
+  - pattern-either:
+    - pattern: $S.findOne($ID)
+    - pattern: '$S.findOneBy({ id: $ID })'
+    - pattern: '$S.findOne({ where: { id: $ID } })'
+    - pattern: $S.findById($ID)
+    - pattern: $S.remove($ID)
+  - pattern-not-inside: |
+      $MM(..., @Req() $A: $TT, ...) { ... }
+  - pattern-not-inside: |
+      $MM(..., @CurrentUser() $A: $TT, ...) { ... }
+  - pattern-not-inside: |
+      $MM(..., @User() $A: $TT, ...) { ... }
+  - pattern-not-inside: |
+      $MM(..., @GetUser() $A: $TT, ...) { ... }
+- id: javascript_idor_rule-OptionalOwnershipParameter
+  severity: ERROR
+  languages:
+  - javascript
+  - typescript
+  message: A parameter that identifies or verifies the record owner is optional, so a caller can omit it and skip
+    the ownership check. Make it required and validate it before any data lookup; never validate it only 'if provided'.
+  metadata:
+    help: |-
+      Consider treating the parameter as required: validate the request with a schema (zod, Joi,
+      express-validator, or a NestJS DTO with class-validator) and reject it when the value is missing
+      or does not match the record. Do this check before any data lookup, not inside an `if
+      (req.query.x)` block that is skipped when the value is absent. Better still, do not accept the
+      owner from the client at all: take it from `req.user` (set by your authentication middleware)
+      and scope the query to it. For secondary-factor checks (such as last name on a PNR lookup),
+      compare with `crypto.timingSafeEqual` and rate limit the endpoint.
+    shortDescription: Optional ownership/verification parameter
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - javascript
+    - typescript
+    - express
+    - nodejs
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-either:
+    - pattern: |
+        if ($REQ.$W.$P) { ... }
+    - pattern: |
+        if ($REQ.$W.$P !== undefined) { ... }
+    - pattern: |
+        if ($REQ.$W.$P != null) { ... }
+  - metavariable-regex:
+      metavariable: $W
+      regex: ^(query|body)$
+  - metavariable-regex:
+      metavariable: $P
+      regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - pattern-not: |
+      if ($REQ.$W.$P) { ... } else { ... }
+- id: javascript_idor_rule-ClientSuppliedIdentity
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript
+  message: The caller's identity is taken from a request parameter and used to load or change data. Any client can
+    send another user's value. Derive the identity from the authenticated session or principal instead.
+  metadata:
+    help: |-
+      Consider deriving the identity from the authenticated session instead of the request: use
+      `req.user.id` set by your authentication middleware (Passport, express-jwt, a NestJS guard) or
+      the claims of the verified JWT. If administrators legitimately act on behalf of other users,
+      keep the parameter but gate it with an explicit role check and fall back to `req.user.id` for
+      everyone else. Never trust a user, account, customer or tenant ID sent by the client as proof of
+      who the caller is.
+    shortDescription: Identity taken from client-controlled input
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - javascript
+    - typescript
+    - express
+    - nodejs
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern: $REQ.$W.$K
+    - metavariable-regex:
+        metavariable: $W
+        regex: ^(body|query|params)$
+    - metavariable-regex:
+        metavariable: $K
+        regex: (?i)^[\"']?\$?(user_?id|owner_?id|customer_?id|account_?id|tenant_?id|member_?id|profile_?id)[\"']?$
+  pattern-sinks:
+  - patterns:
+    - pattern: $M.$F(...)
+    - metavariable-regex:
+        metavariable: $F
+        regex: ^(find|load|fetch|remove|save|select|update)\w*$|^(get|query|delete)\w+$
+- id: javascript_idor_rule-ForwardedForTrusted
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript
+  message: X-Forwarded-For is client-controlled. Using it for rate limiting, lockout or allow-listing lets an attacker
+    rotate the header to bypass the control. Trust it only when set by a known proxy and take the right-most untrusted
+    hop.
+  metadata:
+    help: |-
+      Consider using `req.ip` with Express `app.set('trust proxy', ...)` set to the exact number of
+      hops or the addresses of your load balancers (never `true` on an internet-facing app) instead of
+      reading the header directly. If you must parse the header yourself, take the right-most address
+      that does not belong to a trusted proxy, never the first one. Do not use the client IP as the
+      only key for rate limiting, lockout or allow-listing; combine it with the account or session
+      identifier. With express-rate-limit, review the `keyGenerator` you use.
+    shortDescription: Client IP taken from spoofable header
+    cwe: CWE-348
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - javascript
+    - typescript
+    - express
+    - nodejs
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/348.html
+  patterns:
+  - pattern-either:
+    - pattern: $REQ.headers[$H]
+    - pattern: $REQ.header($H)
+    - pattern: $REQ.get($H)
+    - pattern: $REQ.headers.get($H)
+  - metavariable-regex:
+      metavariable: $H
+      regex: (?i)^[\"']?x.forwarded.for[\"']?$|(?i)^[\"']?http_x_forwarded_for[\"']?$
+- id: javascript_idor_rule-EmptyCatchBlock
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript
+  message: Error is swallowed. When this wraps a configuration, feature-flag or authorization lookup, a failure
+    silently falls back to the insecure default. Log the error and fail closed.
+  metadata:
+    help: |-
+      Consider logging the error (for example `logger.error({ err }, '...')`) and handling it
+      explicitly. When the try block reads configuration, a feature flag or an authorization decision,
+      fail closed: deny the request or rethrow instead of continuing with a default that disables the
+      check. If ignoring the error really is correct, add a comment explaining why so reviewers can
+      tell it is intentional.
+    shortDescription: Swallowed exception
+    cwe: CWE-390
+    owasp:
+    - A09:2021 - Security Logging and Monitoring Failures
+    category: security
+    technology:
+    - javascript
+    - typescript
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/390.html
+  pattern-either:
+  - pattern: |
+      try { ... } catch ($E) { }
+  - pattern: |
+      try { ... } catch { }
+- id: javascript_idor_rule-TokenWithoutExpiry
+  severity: WARNING
+  languages:
+  - javascript
+  - typescript
+  message: Token is issued without an expiration claim, so a leaked token works forever. Add an expiry (exp / expiresIn)
+    and validate it on use.
+  metadata:
+    help: |-
+      Consider passing an expiry when signing, for example `jwt.sign(payload, key, { expiresIn: '15m'
+      })`, and keeping access tokens short-lived with a refresh-token flow for longer sessions.
+      `jwt.verify` checks `exp` by default, so do not pass `ignoreExpiration: true`. Also set and
+      validate the audience and issuer, and provide a way to revoke tokens (deny-list or per-user
+      token version) for logout and password changes.
+    shortDescription: Token issued without expiration
+    cwe: CWE-613
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - javascript
+    - typescript
+    - jwt
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/613.html
+    - https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html
+  patterns:
+  - pattern-either:
+    - pattern: jwt.sign($P, $K)
+    - pattern: jwt.sign($P, $K, { ... })
+  - pattern-not: 'jwt.sign($P, $K, { ..., expiresIn: $E, ... })'
+  - pattern-not: 'jwt.sign({ ..., exp: $E, ... }, $K, ...)'
+- id: python_idor_rule-LookupWithoutOwnershipCheck
+  severity: WARNING
+  languages:
+  - python
+  message: Client-supplied identifier is used to load a record, and this handler never consults the caller's identity
+    or runs a verification call first. Scope the query to the caller (WHERE id = ? AND owner = ?), apply resource-level
+    authorization, or verify a secondary factor before returning data.
+  metadata:
+    help: |-
+      Verify that the authenticated caller may access the record before returning or changing it.
+      Scope the query to the caller, for example `get_object_or_404(Order, pk=pk, owner=request.user)`
+      (Django), `Order.query.filter_by(id=id, owner_id=current_user.id).first_or_404()`
+      (Flask-SQLAlchemy), or the same filter behind a `Depends(get_current_user)` dependency
+      (FastAPI), returning 404 when nothing matches. In Django REST Framework, filter `get_queryset()`
+      by `self.request.user` and add an object-level permission class (`has_object_permission`). If
+      the endpoint is intentionally public (for example a lookup by record locator plus last name),
+      verify that second factor before the lookup and rate limit the endpoint. This rule flags
+      candidates: confirm by requesting another user's record with a second test account and checking
+      that it is refused.
+    shortDescription: Object lookup by client-supplied ID without ownership check
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - python
+    - django
+    - flask
+    - fastapi
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-either:
+    - pattern-inside: |
+        def $F(request, ..., $ID, ...): ...
+    - pattern-inside: |
+        async def $F(request, ..., $ID, ...): ...
+    - pattern-inside: |
+        @$APP.$R(...)
+        def $F(..., $ID, ...): ...
+    - pattern-inside: |
+        @$APP.$R(...)
+        async def $F(..., $ID, ...): ...
+  - metavariable-regex:
+      metavariable: $ID
+      regex: (?i)^[\"']?\$?(?!(user|owner|customer|account|tenant|member|profile)_?id[\"']?$)(\w*_?id|pk|uuid|guid|locator|recordlocator|reservationnumber)[\"']?$
+  - pattern-either:
+    - pattern: $M.objects.get(pk=$ID)
+    - pattern: $M.objects.get(id=$ID)
+    - pattern: get_object_or_404($M, pk=$ID)
+    - pattern: get_object_or_404($M, id=$ID)
+    - pattern: $M.objects.filter(pk=$ID).first()
+    - pattern: $M.query.get($ID)
+    - pattern: $M.query.get_or_404($ID)
+    - pattern: $M.query.filter_by(id=$ID).first()
+    - pattern: $DB.session.get($M, $ID)
+    - pattern: $DB.get($M, $ID)
+    - pattern: $DB.query($M).filter($M2.id == $ID).first()
+  - pattern-not-inside: |
+      def $F2(...):
+        ...
+        current_user
+        ...
+  - pattern-not-inside: |
+      def $F2(...):
+        ...
+        request.user
+        ...
+  - pattern-not-inside: |
+      async def $F2(...):
+        ...
+        request.user
+        ...
+  - pattern-not-inside: |
+      def $F2(...):
+        ...
+        session[...]
+        ...
+  - pattern-not-inside: |
+      def $F2(..., $U = Depends(get_current_user), ...): ...
+  - pattern-not-inside: |
+      async def $F2(..., $U = Depends(get_current_user), ...): ...
+  - pattern-not-inside: |
+      def $F2(..., $U: $TT = Depends(get_current_user), ...): ...
+  - pattern-not-inside: |
+      async def $F2(..., $U: $TT = Depends(get_current_user), ...): ...
+  - pattern-not-inside: |
+      def $F2(..., $U: $TT = Depends(get_current_active_user), ...): ...
+  - pattern-not-inside: |
+      async def $F2(..., $U: $TT = Depends(get_current_active_user), ...): ...
+  - pattern-not-inside: |
+      def $F2(...):
+        ...
+        $S.check_object_permissions(...)
+        ...
+  - pattern-not-inside: |
+      if not $V(..., $ID, ...):
+        ...
+      ...
+- id: python_idor_rule-OptionalOwnershipParameter
+  severity: ERROR
+  languages:
+  - python
+  message: A parameter that identifies or verifies the record owner is optional, so a caller can omit it and skip
+    the ownership check. Make it required and validate it before any data lookup; never validate it only 'if provided'.
+  metadata:
+    help: |-
+      Consider making the parameter required: remove the `=None` default (FastAPI `Query(...)`, a
+      required Pydantic field, or a form/serializer field with `required=True`) and reject the request
+      when it is missing or does not match the record. Do this check before any data lookup, not
+      inside an `if request.args.get(...)` block that is skipped when the value is absent. Better
+      still, take the owner from `request.user`, `current_user` or `Depends(get_current_user)` and
+      scope the query to it. For secondary-factor checks (such as last name on a PNR lookup), compare
+      with `hmac.compare_digest` and rate limit the endpoint.
+    shortDescription: Optional ownership/verification parameter
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - python
+    - django
+    - flask
+    - fastapi
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  pattern-either:
+  - patterns:
+    - pattern: |
+        @$APP.$R(...)
+        def $F(..., $P=None, ...): ...
+    - metavariable-regex:
+        metavariable: $P
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - patterns:
+    - pattern: |
+        @$APP.$R(...)
+        async def $F(..., $P=None, ...): ...
+    - metavariable-regex:
+        metavariable: $P
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - patterns:
+    - pattern: |
+        @$APP.$R(...)
+        def $F(..., $P: $T = None, ...): ...
+    - metavariable-regex:
+        metavariable: $P
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - patterns:
+    - pattern: |
+        @$APP.$R(...)
+        async def $F(..., $P: $T = None, ...): ...
+    - metavariable-regex:
+        metavariable: $P
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - patterns:
+    - pattern: 'def $F(request, ..., $P=None, ...): ...'
+    - metavariable-regex:
+        metavariable: $P
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - patterns:
+    - pattern-either:
+      - pattern: |
+          if $REQ.args.get($K):
+            ...
+      - pattern: |
+          if $REQ.GET.get($K):
+            ...
+      - pattern: |
+          if $REQ.POST.get($K):
+            ...
+      - pattern: |
+          if $REQ.query_params.get($K):
+            ...
+      - pattern: |
+          if $REQ.json.get($K):
+            ...
+      - pattern: |
+          if $REQ.form.get($K):
+            ...
+      - pattern: |
+          if $REQ.data.get($K):
+            ...
+    - metavariable-regex:
+        metavariable: $K
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+- id: python_idor_rule-ClientSuppliedIdentity
+  severity: WARNING
+  languages:
+  - python
+  message: The caller's identity is taken from a request parameter and used to load or change data. Any client can
+    send another user's value. Derive the identity from the authenticated session or principal instead.
+  metadata:
+    help: |-
+      Consider deriving the identity from the authenticated session instead of the request:
+      `request.user` (Django, DRF), `current_user` (Flask-Login) or a `Depends(get_current_user)`
+      dependency (FastAPI). If administrators legitimately act on behalf of other users, keep the
+      parameter but gate it with an explicit permission check (such as `request.user.is_staff` or a
+      DRF permission class) and fall back to the caller's own ID for everyone else. Never trust a
+      user, account, customer or tenant ID sent by the client as proof of who the caller is.
+    shortDescription: Identity taken from client-controlled input
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - python
+    - django
+    - flask
+    - fastapi
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern: $REQ.args.get($K)
+      - pattern: $REQ.GET.get($K)
+      - pattern: $REQ.POST.get($K)
+      - pattern: $REQ.query_params.get($K)
+      - pattern: $REQ.json.get($K)
+      - pattern: $REQ.data.get($K)
+      - pattern: $REQ.form.get($K)
+      - pattern: $REQ.GET[$K]
+      - pattern: $REQ.POST[$K]
+      - pattern: $REQ.args[$K]
+      - pattern: $REQ.json[$K]
+      - pattern: $REQ.form[$K]
+      - pattern: $REQ.data[$K]
+    - metavariable-regex:
+        metavariable: $K
+        regex: (?i)^[\"']?\$?(user_?id|owner_?id|customer_?id|account_?id|tenant_?id|member_?id|profile_?id)[\"']?$
+  pattern-sinks:
+  - patterns:
+    - pattern: $X.$F(...)
+    - metavariable-regex:
+        metavariable: $F
+        regex: ^(find|filter|select|delete|update|remove|fetch|load|save|execute)\w*$|^get_\w+$
+  - pattern: $M.objects.get(...)
+  - pattern: $M.query.get(...)
+- id: python_idor_rule-ForwardedForTrusted
+  severity: WARNING
+  languages:
+  - python
+  message: X-Forwarded-For is client-controlled. Using it for rate limiting, lockout or allow-listing lets an attacker
+    rotate the header to bypass the control. Trust it only when set by a known proxy and take the right-most untrusted
+    hop.
+  metadata:
+    help: |-
+      Consider using the address resolved by trusted proxy middleware instead of reading the header
+      directly: Werkzeug `ProxyFix(app.wsgi_app, x_for=1)` with the exact number of proxies (Flask),
+      Uvicorn `--proxy-headers --forwarded-allow-ips=<load balancer IPs>` (FastAPI), or `REMOTE_ADDR`
+      as set by a trusted reverse proxy (Django). If you must parse the header yourself, take the
+      right-most address that does not belong to a trusted proxy, never the first one. Do not use the
+      client IP as the only key for rate limiting, lockout or allow-listing; combine it with the
+      account or session identifier.
+    shortDescription: Client IP taken from spoofable header
+    cwe: CWE-348
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - python
+    - django
+    - flask
+    - fastapi
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/348.html
+  patterns:
+  - pattern-either:
+    - pattern: $REQ.META[$H]
+    - pattern: $REQ.META.get($H, ...)
+    - pattern: $REQ.headers[$H]
+    - pattern: $REQ.headers.get($H, ...)
+    - pattern: $REQ.environ[$H]
+    - pattern: $REQ.environ.get($H, ...)
+  - metavariable-regex:
+      metavariable: $H
+      regex: (?i)^[\"']?x.forwarded.for[\"']?$|(?i)^[\"']?http_x_forwarded_for[\"']?$
+- id: python_idor_rule-EmptyExceptBlock
+  severity: WARNING
+  languages:
+  - python
+  message: Error is swallowed. When this wraps a configuration, feature-flag or authorization lookup, a failure
+    silently falls back to the insecure default. Log the error and fail closed.
+  metadata:
+    help: |-
+      Consider logging the exception (for example `logger.exception("...")`) and handling it
+      explicitly. When the try block reads configuration, a feature flag or an authorization decision,
+      fail closed: deny the request or re-raise instead of continuing with a default that disables the
+      check. Catch only the exception types you expect rather than a bare `except:` or `except
+      Exception:`. If ignoring the error really is correct, use `contextlib.suppress(SpecificError)`
+      with a comment explaining why.
+    shortDescription: Swallowed exception
+    cwe: CWE-390
+    owasp:
+    - A09:2021 - Security Logging and Monitoring Failures
+    category: security
+    technology:
+    - python
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/390.html
+  pattern-either:
+  - pattern: |
+      try:
+        ...
+      except $E:
+        pass
+  - pattern: |
+      try:
+        ...
+      except:
+        pass
+  - pattern: |
+      try:
+        ...
+      except $E as $X:
+        pass
+- id: python_idor_rule-TokenWithoutExpiry
+  severity: WARNING
+  languages:
+  - python
+  message: Token is issued without an expiration claim, so a leaked token works forever. Add an expiry (exp / expiresIn)
+    and validate it on use.
+  metadata:
+    help: |-
+      Consider adding an `exp` claim when encoding, for example `jwt.encode({"sub": user_id, "exp":
+      datetime.now(timezone.utc) + timedelta(minutes=15)}, key, algorithm="HS256")`, and keeping
+      access tokens short-lived with a refresh-token flow for longer sessions. PyJWT checks `exp` on
+      `jwt.decode` by default, so do not disable it with `options={"verify_exp": False}`; add
+      `options={"require": ["exp"]}` to reject tokens without it. Also set and validate the audience
+      and issuer, and provide a way to revoke tokens (deny-list or per-user token version) for logout
+      and password changes.
+    shortDescription: Token issued without expiration
+    cwe: CWE-613
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - python
+    - jwt
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/613.html
+    - https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html
+  patterns:
+  - pattern: jwt.encode({...}, ...)
+  - pattern-not: 'jwt.encode({..., "exp": $E, ...}, ...)'
+- id: go_idor_rule-LookupWithoutOwnershipCheck
+  severity: WARNING
+  languages:
+  - go
+  message: Client-supplied identifier is used to load a record, and this handler never consults the caller's identity
+    or runs a verification call first. Scope the query to the caller (WHERE id = ? AND owner = ?), apply resource-level
+    authorization, or verify a secondary factor before returning data.
+  metadata:
+    help: |-
+      Verify that the authenticated caller may access the record before returning or changing it.
+      Scope the query to the caller, for example `db.Where("id = ? AND owner_id = ?", id,
+      userID).First(&order)` (GORM), where `userID` comes from the context set by your authentication
+      middleware (such as `c.GetString("userID")` in Gin or a value from `r.Context()`), and return
+      404 on `gorm.ErrRecordNotFound`. For more complex rules, centralize the check in middleware or a
+      policy engine such as Casbin. If the endpoint is intentionally public (for example a lookup by
+      record locator plus last name), verify that second factor before the lookup and rate limit the
+      endpoint. This rule flags candidates: confirm by requesting another user's record with a second
+      test account and checking that it is refused.
+    shortDescription: Object lookup by client-supplied ID without ownership check
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - go
+    - gin
+    - chi
+    - gorm
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern: $C.Param($K)
+      - pattern: $C.Query($K)
+      - pattern: $C.DefaultQuery($K, ...)
+      - pattern: $C.PostForm($K)
+      - pattern: chi.URLParam($R, $K)
+      - pattern: mux.Vars($R)[$K]
+      - pattern: $R.URL.Query().Get($K)
+      - pattern: $R.PathValue($K)
+      - pattern: $R.FormValue($K)
+      - pattern: $C.Params.ByName($K)
+    - metavariable-regex:
+        metavariable: $K
+        regex: (?i)^[\"']?\$?(?!(user|owner|customer|account|tenant|member|profile)_?id[\"']?$)(\w*_?id|pk|uuid|guid|locator|recordlocator|reservationnumber)[\"']?$
+  pattern-sinks:
+  - pattern: $DB.First($OBJ, $ID)
+  - pattern: $DB.Find($OBJ, $ID)
+  - pattern: $DB.Take($OBJ, $ID)
+  - pattern: $DB.Where("id = ?", $ID).First(...)
+  - pattern: $DB.Where("id = ?", $ID).Find(...)
+  - pattern: $DB.Where("id = ?", $ID).Take(...)
+  - patterns:
+    - pattern: $REPO.$GET($ID)
+    - metavariable-regex:
+        metavariable: $GET
+        regex: ^(Get|Find|Load|Fetch)\w+$
+- id: go_idor_rule-OptionalOwnershipParameter
+  severity: ERROR
+  languages:
+  - go
+  message: A parameter that identifies or verifies the record owner is optional, so a caller can omit it and skip
+    the ownership check. Make it required and validate it before any data lookup; never validate it only 'if provided'.
+  metadata:
+    help: |-
+      Consider treating the parameter as required: reject the request (for example
+      `c.AbortWithStatus(http.StatusBadRequest)`) when it is empty or does not match the record, or
+      use binding validation such as `binding:"required"` in Gin. Do this check before any data
+      lookup, not inside an `if c.Query(...) != ""` block that is skipped when the value is absent.
+      Better still, take the owner from the authenticated request context and scope the query to it.
+      For secondary-factor checks (such as last name on a PNR lookup), compare with
+      `subtle.ConstantTimeCompare` and rate limit the endpoint.
+    shortDescription: Optional ownership/verification parameter
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - go
+    - gin
+    - chi
+    - gorm
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-either:
+    - pattern: if $C.Query($K) != "" { ... }
+    - pattern: if $C.PostForm($K) != "" { ... }
+    - pattern: if $R.URL.Query().Get($K) != "" { ... }
+    - pattern: if $R.FormValue($K) != "" { ... }
+    - pattern: if $C.DefaultQuery($K, "") != "" { ... }
+  - metavariable-regex:
+      metavariable: $K
+      regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+- id: go_idor_rule-ClientSuppliedIdentity
+  severity: WARNING
+  languages:
+  - go
+  message: The caller's identity is taken from a request parameter and used to load or change data. Any client can
+    send another user's value. Derive the identity from the authenticated session or principal instead.
+  metadata:
+    help: |-
+      Consider deriving the identity from the authenticated request context instead of request
+      parameters: read the user ID your authentication middleware stores after verifying the session
+      or JWT (for example `c.MustGet("userID")` in Gin or `r.Context().Value(userKey)`). If
+      administrators legitimately act on behalf of other users, keep the parameter but gate it with an
+      explicit role check and fall back to the caller's own ID for everyone else. Never trust a user,
+      account, customer or tenant ID sent by the client as proof of who the caller is.
+    shortDescription: Identity taken from client-controlled input
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - go
+    - gin
+    - chi
+    - gorm
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern: $C.Param($K)
+      - pattern: $C.Query($K)
+      - pattern: $C.DefaultQuery($K, ...)
+      - pattern: $C.PostForm($K)
+      - pattern: chi.URLParam($R, $K)
+      - pattern: mux.Vars($R)[$K]
+      - pattern: $R.URL.Query().Get($K)
+      - pattern: $R.PathValue($K)
+      - pattern: $R.FormValue($K)
+      - pattern: $C.Params.ByName($K)
+    - metavariable-regex:
+        metavariable: $K
+        regex: (?i)^[\"']?\$?(user_?id|owner_?id|customer_?id|account_?id|tenant_?id|member_?id|profile_?id)[\"']?$
+  pattern-sinks:
+  - patterns:
+    - pattern: $X.$F(...)
+    - metavariable-regex:
+        metavariable: $F
+        regex: ^(Get|Delete)\w+$|^(Find|Load|Fetch|First|Where|Update|Remove|Save|Select|Take)\w*$
+- id: go_idor_rule-ForwardedForTrusted
+  severity: WARNING
+  languages:
+  - go
+  message: X-Forwarded-For is client-controlled. Using it for rate limiting, lockout or allow-listing lets an attacker
+    rotate the header to bypass the control. Trust it only when set by a known proxy and take the right-most untrusted
+    hop.
+  metadata:
+    help: |-
+      Consider using `r.RemoteAddr` when the service is not behind a proxy, or a proxy-aware helper
+      restricted to your load balancers: in Gin call `router.SetTrustedProxies([]string{...})` and use
+      `c.ClientIP()` (it trusts every proxy until you do), and use chi's `middleware.RealIP` only
+      behind a proxy that overwrites the header. If you must parse the header yourself, take the
+      right-most address that does not belong to a trusted proxy, never the first one. Do not use the
+      client IP as the only key for rate limiting, lockout or allow-listing; combine it with the
+      account or session identifier.
+    shortDescription: Client IP taken from spoofable header
+    cwe: CWE-348
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - go
+    - gin
+    - chi
+    - gorm
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/348.html
+  patterns:
+  - pattern-either:
+    - pattern: $R.Header.Get($H)
+    - pattern: $C.GetHeader($H)
+    - pattern: $R.Header[$H]
+  - metavariable-regex:
+      metavariable: $H
+      regex: (?i)^[\"']?x.forwarded.for[\"']?$|(?i)^[\"']?http_x_forwarded_for[\"']?$
+- id: go_idor_rule-EmptyErrorHandler
+  severity: WARNING
+  languages:
+  - go
+  message: Error is swallowed. When this wraps a configuration, feature-flag or authorization lookup, a failure
+    silently falls back to the insecure default. Log the error and fail closed.
+  metadata:
+    help: |-
+      Consider logging the error (for example `slog.Error("...", "err", err)`) and handling it
+      explicitly: return it to the caller, wrap it with `fmt.Errorf("...: %w", err)`, or respond with
+      an error status. When the call reads configuration, a feature flag or an authorization decision,
+      fail closed: deny the request instead of continuing with a default that disables the check. If
+      ignoring the error really is correct, assign it to `_` with a comment explaining why instead of
+      leaving an empty `if` block.
+    shortDescription: Swallowed exception
+    cwe: CWE-390
+    owasp:
+    - A09:2021 - Security Logging and Monitoring Failures
+    category: security
+    technology:
+    - go
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/390.html
+  pattern: |
+    if $ERR != nil { }
+- id: go_idor_rule-TokenWithoutExpiry
+  severity: WARNING
+  languages:
+  - go
+  message: Token is issued without an expiration claim, so a leaked token works forever. Add an expiry (exp / expiresIn)
+    and validate it on use.
+  metadata:
+    help: |-
+      Consider setting an expiry in the claims, for example `jwt.RegisteredClaims{Subject: userID,
+      ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute))}` or `"exp": time.Now().Add(15 *
+      time.Minute).Unix()` in `jwt.MapClaims`, and keeping access tokens short-lived with a
+      refresh-token flow for longer sessions. golang-jwt only checks `exp` when it is present, so
+      parse with `jwt.WithExpirationRequired()` (v5) to reject tokens without it. Also set and
+      validate the audience and issuer, and provide a way to revoke tokens (deny-list or per-user
+      token version) for logout and password changes.
+    shortDescription: Token issued without expiration
+    cwe: CWE-613
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - go
+    - jwt
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/613.html
+    - https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html
+  patterns:
+  - pattern-either:
+    - pattern: jwt.NewWithClaims($M, jwt.MapClaims{...})
+    - pattern: jwt.NewWithClaims($M, jwt.StandardClaims{...})
+    - pattern: jwt.NewWithClaims($M, jwt.RegisteredClaims{...})
+  - pattern-not: 'jwt.NewWithClaims($M, jwt.MapClaims{..., "exp": $E, ...})'
+  - pattern-not: 'jwt.NewWithClaims($M, jwt.StandardClaims{..., ExpiresAt: $E, ...})'
+  - pattern-not: 'jwt.NewWithClaims($M, jwt.RegisteredClaims{..., ExpiresAt: $E, ...})'
+- id: php_idor_rule-LookupWithoutOwnershipCheck
+  severity: WARNING
+  languages:
+  - php
+  message: Client-supplied identifier is used to load a record, and this handler never consults the caller's identity
+    or runs a verification call first. Scope the query to the caller (WHERE id = ? AND owner = ?), apply resource-level
+    authorization, or verify a secondary factor before returning data.
+  metadata:
+    help: |-
+      Verify that the authenticated caller may access the record before returning or changing it.
+      Scope the query to the caller, for example `$request->user()->orders()->findOrFail($id)` or
+      `Order::where('id', $id)->where('user_id', auth()->id())->firstOrFail()` (Laravel), or
+      `$repo->findOneBy(['id' => $id, 'owner' => $this->getUser()])` (Symfony), and return 404 when
+      nothing matches. For more complex rules, use Laravel policies (`$this->authorize('view',
+      $order)`) or Symfony voters (`$this->denyAccessUnlessGranted('VIEW', $order)`). If the endpoint
+      is intentionally public (for example a lookup by record locator plus last name), verify that
+      second factor before the lookup and rate limit the endpoint. This rule flags candidates: confirm
+      by requesting another user's record with a second test account and checking that it is refused.
+    shortDescription: Object lookup by client-supplied ID without ownership check
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - php
+    - laravel
+    - symfony
+    - slim
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  patterns:
+  - pattern-either:
+    - pattern-inside: |
+        function $M(..., $ID, ...) { ... }
+    - pattern-inside: |
+        function $M(..., $T $ID, ...) { ... }
+  - metavariable-regex:
+      metavariable: $ID
+      regex: (?i)^[\"']?\$?(?!(user|owner|customer|account|tenant|member|profile)_?id[\"']?$)(\w*_?id|pk|uuid|guid|locator|recordlocator|reservationnumber)[\"']?$
+  - pattern-either:
+    - pattern: $CLS::find($ID)
+    - pattern: $CLS::findOrFail($ID)
+    - pattern: $CLS::where('id', $ID)->first()
+    - pattern: $CLS::where('id', $ID)->firstOrFail()
+    - pattern: $CLS::where('id', $ID)->get()
+    - pattern: $R->find($ID)
+    - pattern: $R->findOneBy(['id' => $ID])
+    - pattern: $EM->find($CLASS, $ID)
+  - pattern-not-inside: |
+      function $MM(...) {
+        ...
+        $X->user();
+        ...
+      }
+  - pattern-not-inside: |
+      function $MM(...) {
+        ...
+        Auth::user();
+        ...
+      }
+  - pattern-not-inside: |
+      function $MM(...) {
+        ...
+        Auth::id();
+        ...
+      }
+  - pattern-not-inside: |
+      function $MM(...) {
+        ...
+        auth()->user();
+        ...
+      }
+  - pattern-not-inside: |
+      function $MM(...) {
+        ...
+        $this->authorize(...);
+        ...
+      }
+  - pattern-not-inside: |
+      function $MM(...) {
+        ...
+        Gate::authorize(...);
+        ...
+      }
+  - pattern-not-inside: |
+      function $MM(...) {
+        ...
+        $this->denyAccessUnlessGranted(...);
+        ...
+      }
+  - pattern-not-inside: |
+      if (!$V(..., $ID, ...)) { ... }
+      ...
+- id: php_idor_rule-OptionalOwnershipParameter
+  severity: ERROR
+  languages:
+  - php
+  message: A parameter that identifies or verifies the record owner is optional, so a caller can omit it and skip
+    the ownership check. Make it required and validate it before any data lookup; never validate it only 'if provided'.
+  metadata:
+    help: |-
+      Consider making the parameter required: remove the `= null` default and validate the request
+      (Laravel `$request->validate(['last_name' => 'required'])`, Symfony Validator `NotBlank`),
+      rejecting it when the value is missing or does not match the record. Do this check before any
+      data lookup, not inside an `if ($request->has(...))` block that is skipped when the value is
+      absent. Better still, take the owner from `auth()->user()` or `$this->getUser()` and scope the
+      query to it. For secondary-factor checks (such as last name on a PNR lookup), compare with
+      `hash_equals` and rate limit the endpoint.
+    shortDescription: Optional ownership/verification parameter
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - php
+    - laravel
+    - symfony
+    - slim
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  pattern-either:
+  - patterns:
+    - pattern: function $M(..., $P = null, ...) { ... }
+    - metavariable-regex:
+        metavariable: $P
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - patterns:
+    - pattern: function $M(..., $T $P = null, ...) { ... }
+    - metavariable-regex:
+        metavariable: $P
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+  - patterns:
+    - pattern-either:
+      - pattern: if ($REQ->has($K)) { ... }
+      - pattern: if ($REQ->filled($K)) { ... }
+      - pattern: if (isset($_GET[$K])) { ... }
+      - pattern: if (!empty($_GET[$K])) { ... }
+      - pattern: if (isset($_POST[$K])) { ... }
+      - pattern: if ($REQ->query($K)) { ... }
+    - metavariable-regex:
+        metavariable: $K
+        regex: (?i)^[\"']?\$?((l|last)_?name|surname|owner_?id|user_?id|account_?id|customer_?id|tenant_?id)[\"']?$
+- id: php_idor_rule-ClientSuppliedIdentity
+  severity: WARNING
+  languages:
+  - php
+  message: The caller's identity is taken from a request parameter and used to load or change data. Any client can
+    send another user's value. Derive the identity from the authenticated session or principal instead.
+  metadata:
+    help: |-
+      Consider deriving the identity from the authenticated session instead of the request:
+      `auth()->id()` or `$request->user()` (Laravel), or `$this->getUser()` (Symfony). If
+      administrators legitimately act on behalf of other users, keep the parameter but gate it with an
+      explicit check (`Gate::authorize(...)` or `$this->isGranted('ROLE_ADMIN')`) and fall back to the
+      caller's own ID for everyone else. Never trust a user, account, customer or tenant ID sent by
+      the client as proof of who the caller is.
+    shortDescription: Identity taken from client-controlled input
+    cwe: CWE-639
+    owasp:
+    - A01:2021 - Broken Access Control
+    category: security
+    technology:
+    - php
+    - laravel
+    - symfony
+    - slim
+    confidence: LOW
+    likelihood: MEDIUM
+    impact: HIGH
+    subcategory:
+    - audit
+    references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/639.html
+  mode: taint
+  pattern-sources:
+  - patterns:
+    - pattern-either:
+      - pattern: $REQ->input($K)
+      - pattern: $REQ->get($K)
+      - pattern: $REQ->query($K)
+      - pattern: $REQ->query->get($K)
+      - pattern: $REQ->request->get($K)
+      - pattern: $_GET[$K]
+      - pattern: $_POST[$K]
+      - pattern: $_REQUEST[$K]
+    - metavariable-regex:
+        metavariable: $K
+        regex: (?i)^[\"']?\$?(user_?id|owner_?id|customer_?id|account_?id|tenant_?id|member_?id|profile_?id)[\"']?$
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: $X->$F(...)
+      - pattern: $X::$F(...)
+    - metavariable-regex:
+        metavariable: $F
+        regex: ^(find|load|fetch|delete|update|remove|save|select|where)\w*$|^get\w+$
+- id: php_idor_rule-ForwardedForTrusted
+  severity: WARNING
+  languages:
+  - php
+  message: X-Forwarded-For is client-controlled. Using it for rate limiting, lockout or allow-listing lets an attacker
+    rotate the header to bypass the control. Trust it only when set by a known proxy and take the right-most untrusted
+    hop.
+  metadata:
+    help: |-
+      Consider using `$request->ip()` (Laravel) or `$request->getClientIp()` (Symfony) with trusted
+      proxies configured instead of reading the header directly: Laravel's `TrustProxies` middleware
+      set to your load balancer addresses (not `'*'` on an internet-facing app), or Symfony's
+      `framework.trusted_proxies`. Without a proxy, use `$_SERVER['REMOTE_ADDR']`. If you must parse
+      the header yourself, take the right-most address that does not belong to a trusted proxy, never
+      the first one. Do not use the client IP as the only key for rate limiting, lockout or
+      allow-listing; combine it with the account or session identifier.
+    shortDescription: Client IP taken from spoofable header
+    cwe: CWE-348
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - php
+    - laravel
+    - symfony
+    - slim
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/348.html
+  patterns:
+  - pattern-either:
+    - pattern: $_SERVER[$H]
+    - pattern: $REQ->header($H)
+    - pattern: $REQ->getHeaderLine($H)
+    - pattern: $REQ->headers->get($H)
+    - pattern: getenv($H)
+  - metavariable-regex:
+      metavariable: $H
+      regex: (?i)^[\"']?x.forwarded.for[\"']?$|(?i)^[\"']?http_x_forwarded_for[\"']?$
+- id: php_idor_rule-EmptyCatchBlock
+  severity: WARNING
+  languages:
+  - php
+  message: Error is swallowed. When this wraps a configuration, feature-flag or authorization lookup, a failure
+    silently falls back to the insecure default. Log the error and fail closed.
+  metadata:
+    help: |-
+      Consider logging the exception (for example `$this->logger->error($e->getMessage(), ['exception'
+      => $e])`) and handling it explicitly. When the try block reads configuration, a feature flag or
+      an authorization decision, fail closed: deny the request or rethrow instead of continuing with a
+      default that disables the check. Catch only the exception types you expect rather than
+      `\Exception` or `\Throwable`. If ignoring the error really is correct, add a comment explaining
+      why.
+    shortDescription: Swallowed exception
+    cwe: CWE-390
+    owasp:
+    - A09:2021 - Security Logging and Monitoring Failures
+    category: security
+    technology:
+    - php
+    confidence: HIGH
+    likelihood: LOW
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/390.html
+  pattern: |
+    try { ... } catch ($T $E) { }
+- id: php_idor_rule-TokenWithoutExpiry
+  severity: WARNING
+  languages:
+  - php
+  message: Token is issued without an expiration claim, so a leaked token works forever. Add an expiry (exp / expiresIn)
+    and validate it on use.
+  metadata:
+    help: |-
+      Consider adding an `exp` claim when encoding, for example `JWT::encode(['sub' => $userId, 'exp'
+      => time() + 900], $key, 'HS256')`, and keeping access tokens short-lived with a refresh-token
+      flow for longer sessions. firebase/php-jwt only rejects expired tokens when `exp` is present, so
+      check that the decoded payload has it. Also set and validate the audience and issuer, and
+      provide a way to revoke tokens (deny-list or per-user token version) for logout and password
+      changes.
+    shortDescription: Token issued without expiration
+    cwe: CWE-613
+    owasp:
+    - A07:2021 - Identification and Authentication Failures
+    category: security
+    technology:
+    - php
+    - jwt
+    confidence: MEDIUM
+    likelihood: MEDIUM
+    impact: MEDIUM
+    subcategory:
+    - audit
+    references:
+    - https://cwe.mitre.org/data/definitions/613.html
+    - https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html
+  patterns:
+  - pattern: JWT::encode([...], ...)
+  - pattern-not: JWT::encode([..., 'exp' => $E, ...], ...)
